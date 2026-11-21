@@ -1,0 +1,49 @@
+# ============================================================
+# MicroJM - .gitignore (STM32CubeIDE + KiCad)
+# ============================================================
+
+# --- Saida de compilacao (gerada a cada build) ---------------
+Debug/
+Release/
+**/Debug/
+**/Release/
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.map
+*.list
+*.hex
+*.bin
+
+# --- Workspace do Eclipse/CubeIDE (local de cada PC) ---------
+.metadata/
+RemoteSystemsTempFiles/
+*.launch.bak
+
+# --- Projeto de referencia ZoroBot3 (tem repositorio proprio)
+ZoroBot3.zip
+ZoroBot3_repo/
+ZoroBot3_tmp/
+
+# --- Copias de seguranca feitas durante os testes ------------
+_backup_*/
+
+# --- KiCad: travas, backups e caches -------------------------
+*.lck
+~*.lck
+*-bak
+*.bak
+*.bck
+*-backups/
+fp-info-cache
+*.kicad_prl
+
+# --- Sistema operacional ---------------------------------------
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# KiCad 9: historico local (e um repositorio Git proprio, quebra o git add)
+.history/

@@ -1,0 +1,20 @@
+EESchema-LIBRARY Version 2.4
+#encoding utf-8
+#
+# Step_sown
+#
+DEF Step_sown U 0 40 Y Y 1 F N
+F0 "U" -50 -50 47 H V C CNN
+F1 "Step_sown" -50 -150 47 H V C CNN
+F2 "" 0 0 47 H I C CNN
+F3 "" 0 0 47 H I C CNN
+DRAW
+S -250 150 150 -450 0 1 0 f
+X IN+ 1 -150 350 200 D 50 50 1 1 B
+X IN- 2 50 350 200 D 50 50 1 1 I
+X OUT- 3 50 -650 200 U 50 50 1 1 O
+X OUT+ 4 -150 -650 200 U 50 50 1 1 O
+ENDDRAW
+ENDDEF
+#
+#End Library

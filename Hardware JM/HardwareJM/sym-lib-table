@@ -1,0 +1,6 @@
+(sym_lib_table
+	(version 7)
+	(lib (name "step_down") (type "Legacy") (uri "C:/Users/lukas/Documents/sumocup_2019/sumo_2019_2/sumo_prototipo/sumo_2019_protot/step_down.lib") (options "") (descr ""))
+	(lib (name "chave") (type "Legacy") (uri "C:/Users/lukas/Documents/sumocup_2019/sumo_2019_2/sumo_prototipo/sumo_2019_protot/chave.lib") (options "") (descr ""))
+	(lib (name "sumo_2019_protot-rescue") (type "KiCad") (uri "${KIPRJMOD}/sumo_2019_protot-rescue.kicad_sym") (options "") (descr ""))
+)
