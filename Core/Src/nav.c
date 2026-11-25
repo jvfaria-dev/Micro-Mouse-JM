@@ -28,13 +28,14 @@ typedef enum
     NAV_TURN,           /* girando 90 graus no proprio eixo             */
     NAV_SETTLE,         /* pausa curta depois do giro, para estabilizar */
     NAV_DONE,           /* saiu do labirinto                            */
-    NAV_ABORT           /* parou por seguranca                          */
+    NAV_ABORT,          /* parou por seguranca                          */
+    NAV_DEADBACK        /* entrou na zona morta do Sharp: recua (24/11) */
 } nav_state_t;
 
 static const char *const state_name[] =
 {
     "ESPERA", "CORREDOR", "APROXIMA", "RECUA", "GIRO", "ASSENTA", "FIM",
-    "ABORTADO"
+    "ABORTADO", "RECUA-ZM"
 };
 
 /* ---------------------------------------------------------------------------
@@ -71,6 +72,9 @@ static float       wf_deriv    = 0.0f;
  * duas): misturar as duas derivadas daria um chute de comando na troca de
  * estado, justamente no trecho mais critico do percurso. */
 static float       ap_err_prev = 0.0f;
+/* recuo da zona morta (24/11) */
+static int16_t     db_start = 0;        /* leitura frontal ao comecar a recuar */
+static int16_t     db_max   = 0;        /* maior leitura durante o recuo       */
 static float       ap_deriv    = 0.0f;
 
 /* ---------------------------------------------------------------------------
@@ -83,6 +87,20 @@ static void enter(nav_state_t s)
     state_ms = 0u;
     mark_mm  = speed_ctl_get_distance_mm();
     mark_deg = speed_ctl_get_heading_deg();
+    if (s == NAV_FOLLOW)
+    {
+        speed_ctl_hold_mark();          /* rumo de saida do giro */
+    }
+    if (s == NAV_APPROACH)
+    {
+        sensors_dead_reset(SENSOR_FRONT);
+    }
+    if (s == NAV_DEADBACK)
+    {
+        db_start = port_sensors_get_prox(SENSOR_FRONT);
+        db_max   = db_start;
+        speed_ctl_hold_mark();
+    }
 
     port_debug_printf("[nav] -> %s   (dist %ld mm, ang %ld graus)\r\n",
                       state_name[s],
@@ -144,6 +162,10 @@ static void drive_centered(float speed_mms)
         wf_deriv += (de - wf_deriv) * WALL_FOLLOW_D_ALPHA;
 
         turn = (e * WALL_FOLLOW_KP) + (wf_deriv * WALL_FOLLOW_KD);
+
+        /* com parede quem manda e' a parede; o rumo de agora vira a
+         * referencia para o proximo trecho sem parede */
+        speed_ctl_hold_mark();
     }
     else
     {
@@ -154,8 +176,10 @@ static void drive_centered(float speed_mms)
 
         /* Sem parede nenhuma nao existe referencia externa: o carrinho anda
          * em malha aberta e qualquer assimetria vira arco. STRAIGHT_TRIM_MMS
-         * e' o unico contrapeso disponivel aqui. */
-        turn = STRAIGHT_TRIM_MMS;
+         * e' o unico contrapeso disponivel aqui.
+         * 23/11: + segura o ultimo rumo confirmado pelas paredes, pelos
+         * encoders (speed_ctl_hold_turn). */
+        turn = STRAIGHT_TRIM_MMS + speed_ctl_hold_turn();
     }
 
     if (turn >  WALL_FOLLOW_MAX_MMS) { turn =  WALL_FOLLOW_MAX_MMS; }
@@ -221,7 +245,7 @@ static void drive_approach(float speed_mms)
     }
     else
     {
-        turn = STRAIGHT_TRIM_MMS;
+        turn = STRAIGHT_TRIM_MMS + speed_ctl_hold_turn();   /* 23/11 */
     }
 
     if (turn >  WALL_FOLLOW_MAX_MMS) { turn =  WALL_FOLLOW_MAX_MMS; }
@@ -232,22 +256,36 @@ static void drive_approach(float speed_mms)
 
 /** Decide o lado do giro, em QUARTOS de volta: +1 esquerda, -1 direita,
  *  +2 meia-volta. */
+/* 1 parede certa, 0 aberto certo, -1 duvida (ver NAV_SIDE_* no nav.h) */
+static int side_class(sensor_id_t s)
+{
+    int16_t p = port_sensors_get_prox(s);
+    if (p >= NAV_SIDE_WALL_MIN) { return 1; }
+    if (p <= NAV_SIDE_OPEN_MAX) { return 0; }
+    return -1;
+}
+
 static int choose_turn_quarters(void)
 {
-    bool left_open  = !port_sensors_wall(SENSOR_LEFT);
-    bool right_open = !port_sensors_wall(SENSOR_RIGHT);
+    int l = side_class(SENSOR_LEFT);
+    int r = side_class(SENSOR_RIGHT);
+    const int pref = (NAV_PREFER_RIGHT != 0) ? -1 : 1;
 
-    if (left_open && !right_open)  { return  1; }
-    if (right_open && !left_open)  { return -1; }
+    port_debug_printf("[nav] escolhe giro: ESQ %d (%s) DIR %d (%s)\r\n",
+                      (int)port_sensors_get_prox(SENSOR_LEFT),
+                      (l == 1) ? "parede" : (l == 0) ? "aberto" : "duvida",
+                      (int)port_sensors_get_prox(SENSOR_RIGHT),
+                      (r == 1) ? "parede" : (r == 0) ? "aberto" : "duvida");
 
-    if (left_open && right_open)
-    {
-#if (NAV_PREFER_RIGHT != 0)
-        return -1;
-#else
-        return  1;
-#endif
-    }
+    /* 1o: lado aberto com certeza */
+    if (l == 0 && r == 0) { return pref; }
+    if (l == 0)           { return  1; }
+    if (r == 0)           { return -1; }
+
+    /* 2o: lado na duvida (nao gasta meia-volta por uma leitura de vies) */
+    if (l < 0 && r < 0)   { return pref; }
+    if (l < 0)            { return  1; }
+    if (r < 0)            { return -1; }
 
     /* Beco sem saida: os dois lados e a frente fechados -> meia-volta. */
     port_debug_printf("[nav] beco sem saida, meia-volta\r\n");
@@ -391,6 +429,18 @@ void nav_update(void)
          * mesmo lugar -- foi exatamente isso que a simulacao mostrou ser
          * necessario: girando fora do centro, o carrinho entrava torto no
          * corredor seguinte e raspava a parede. */
+        /* 24/11: passou do pico do Sharp (mais perto que ~1,3 cm, zona
+         * morta): a leitura cai e nunca chegaria ao alvo. Para e recua. */
+        if (sensors_dead_update(SENSOR_FRONT, NAV_PERIOD_MS) == SENSOR_ZONE_DEAD)
+        {
+            speed_ctl_stop();
+            port_debug_printf("[nav] zona morta frontal: max %d agora %d -> recua\r\n",
+                              (int)sensors_dead_max(SENSOR_FRONT),
+                              (int)port_sensors_get_prox(SENSOR_FRONT));
+            enter(NAV_DEADBACK);
+            break;
+        }
+
         if (port_sensors_front() >= SENSOR_FRONT_CENTER
             || dist_since_mark() >= NAV_APPROACH_MAX_MM)
         {
@@ -431,6 +481,39 @@ void nav_update(void)
             drive_approach(v);
         }
         break;
+
+    /* ------------------------------------------------------------------ */
+    case NAV_DEADBACK:
+    {
+        /* Recua devagar segurando o rumo. Recuando, a leitura primeiro SOBE
+         * (volta ao pico) e depois CAI: quando cai ate' SENSOR_FRONT_CENTER,
+         * o robo esta' de novo no lado bom da curva, a ~2 cm da parede. */
+        int16_t f = port_sensors_get_prox(SENSOR_FRONT);
+        if (f > db_max) { db_max = f; }
+        bool  rose   = (db_max >= db_start + SENSOR_BACKOFF_RISE);
+        bool  fell   = rose && (f <= db_max - 20)
+                    && (f <= SENSOR_FRONT_CENTER || f <= db_max - SENSOR_DEAD_DROP);
+        float back   = -dist_since_mark();
+
+        if (fell || back >= SENSOR_BACKOFF_MAX_MM || state_ms >= SENSOR_BACKOFF_TIMEOUT_MS)
+        {
+            speed_ctl_stop();
+            port_debug_printf("[nav] recuou %d mm, frente %d (max %d)%s\r\n",
+                              (int)back, (int)f, (int)db_max,
+                              fell ? "" : " -- NAO achou o pico, segue assim");
+
+            /* mesmo fim da APROXIMA: decide o giro daqui */
+            turn_quarters = choose_turn_quarters();
+            enter((NAV_TURN_BACKUP_MM > 0.0f) ? NAV_BACKUP : NAV_TURN);
+            if (NAV_TURN_BACKUP_MM <= 0.0f)
+            {
+                turn_target_ticks += turn_ticks_for(turn_quarters);
+            }
+            break;
+        }
+        speed_ctl_set_vw(-SENSOR_BACKOFF_MMS, speed_ctl_hold_turn());
+        break;
+    }
 
     /* ------------------------------------------------------------------ */
     case NAV_BACKUP:

@@ -67,6 +67,14 @@ bool maze_is_target(uint8_t x, uint8_t y);
 void maze_set_walls(uint8_t x, uint8_t y, maze_dir_t h,
                     bool left, bool front, bool right);
 
+/**
+ * @brief Igual a maze_set_walls, mas cada lado pode ser -1 = "nao sei"
+ *        (leitura na faixa de duvida): esse lado nao recebe voto.
+ *        1 = parede, 0 = aberto.
+ */
+void maze_set_walls3(uint8_t x, uint8_t y, maze_dir_t h,
+                     int8_t left, int8_t front, int8_t right);
+
 /** @brief Parede confirmada (bateu nela / nao conseguiu sair). */
 void maze_force_wall(uint8_t x, uint8_t y, maze_dir_t d);
 
@@ -75,6 +83,15 @@ bool maze_wall_locked(uint8_t x, uint8_t y, maze_dir_t d);
 
 /** @brief Esquece paredes vistas uma vez so' (recuperacao de leitura errada). */
 void maze_forget_weak(void);
+
+/**
+ * @brief Tira UM voto de toda parede/abertura nao travada (+2 -> +1,
+ *        +1 -> 0, -1 -> 0 ...). Recuperacao mais forte que maze_forget_weak:
+ *        usada quando, mesmo esquecendo as leituras fracas, nao ha' caminho
+ *        (parede fantasma lida duas vezes). Paredes reais voltam a ser lidas
+ *        quando o robo passa por elas de novo.
+ */
+void maze_weaken(void);
 
 /** @brief Ha' parede (conhecida) no lado d da celula? */
 bool maze_wall(uint8_t x, uint8_t y, maze_dir_t d);

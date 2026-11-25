@@ -195,6 +195,12 @@ bool maze_is_target(uint8_t x, uint8_t y)
 void maze_set_walls(uint8_t x, uint8_t y, maze_dir_t h,
                     bool left, bool front, bool right)
 {
+    maze_set_walls3(x, y, h, left ? 1 : 0, front ? 1 : 0, right ? 1 : 0);
+}
+
+void maze_set_walls3(uint8_t x, uint8_t y, maze_dir_t h,
+                     int8_t left, int8_t front, int8_t right)
+{
     if (!inside(x, y))
     {
         return;
@@ -203,9 +209,10 @@ void maze_set_walls(uint8_t x, uint8_t y, maze_dir_t h,
     maze_dir_t dl = (maze_dir_t)((h + 3) & 3);
     maze_dir_t dr = (maze_dir_t)((h + 1) & 3);
 
-    vote_wall(x, y, dl, left);
-    vote_wall(x, y, h,  front);
-    vote_wall(x, y, dr, right);
+    /* -1 = leitura duvidosa: nao vota, o lado fica como estava */
+    if (left  >= 0) { vote_wall(x, y, dl, left  != 0); }
+    if (front >= 0) { vote_wall(x, y, h,  front != 0); }
+    if (right >= 0) { vote_wall(x, y, dr, right != 0); }
 
     cell[x][y] |= CELL_SEEN;
 }
@@ -233,6 +240,27 @@ void maze_forget_weak(void)
                     vote[x][y][d] = 0;
                     apply_vote(x, y, (maze_dir_t)d, 0);
                 }
+            }
+        }
+    }
+}
+
+void maze_weaken(void)
+{
+    for (uint8_t x = 0; x < MAZE_W; x++)
+    {
+        for (uint8_t y = 0; y < MAZE_H; y++)
+        {
+            for (int d = 0; d < 4; d++)
+            {
+                int8_t v = vote[x][y][d];
+                if (v >= VOTE_FIXED || v == 0)
+                {
+                    continue;                   /* travada ou sem leitura */
+                }
+                v = (v > 0) ? (int8_t)(v - 1) : (int8_t)(v + 1);
+                vote[x][y][d] = v;
+                apply_vote(x, y, (maze_dir_t)d, v);
             }
         }
     }

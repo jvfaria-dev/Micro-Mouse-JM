@@ -52,6 +52,7 @@
 #include "trace.h"
 #include "imu_test.h"
 #include "solver.h"
+#include "decide_test.h"
 
 #include <stdint.h>
 
@@ -79,9 +80,12 @@
 #define APP_MODE_TURN_CAL       6
 #define APP_MODE_IMU_TEST       7
 #define APP_MODE_SOLVE          8   /* flood fill: explora, volta e corre */
+#define APP_MODE_DECIDE_TEST    9   /* parado: Sharp -> decisao de giro do flood fill */
+#define APP_MODE_DECIDE_TEST_MOTOR 10 /* andando: SOLVE com linha [DEC] por celula */
+#define APP_MODE_LOCAL_TEST     11  /* andando: decide so' pelos Sharp, sem mapa */
 
 #ifndef APP_MODE
-#define APP_MODE                APP_MODE_MAZE
+#define APP_MODE                APP_MODE_LOCAL_TEST
 #endif
 
 /* Modos que usam controle de velocidade, sensores e navegacao. */

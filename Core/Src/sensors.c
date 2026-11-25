@@ -184,6 +184,10 @@ bool sensors_wall_ahead(void)
 
 int16_t sensors_front(void)
 {
+#if !SENSOR_FRONT_USE_DIAGONALS
+    /* So' o central: os diagonais veem as paredes laterais (board.h). */
+    return prox[SENSOR_FRONT];
+#else
     /* Prioriza o sensor central frontal SL5; se os frontais diagonais estiverem proximos, inclui na media */
     int32_t sum = prox[SENSOR_FRONT];
     int32_t count = 1;
@@ -200,6 +204,46 @@ int16_t sensors_front(void)
     }
 
     return (int16_t)(sum / count);
+#endif
+}
+
+/* --- Zona morta (24/11) ---------------------------------------------- */
+static int16_t  dz_max[SENSOR_COUNT];
+static uint32_t dz_ms[SENSOR_COUNT];
+
+void sensors_dead_reset(sensor_id_t s)
+{
+    if (s < SENSOR_COUNT) { dz_max[s] = 0; dz_ms[s] = 0u; }
+}
+
+sensor_zone_t sensors_dead_update(sensor_id_t s, uint32_t dt_ms)
+{
+    if (s >= SENSOR_COUNT) { return SENSOR_ZONE_OK; }
+
+    int16_t p = prox[s];
+    if (p > dz_max[s]) { dz_max[s] = p; }
+
+    /* so' da' para entrar na zona morta vindo do topo da curva */
+    if (dz_max[s] >= SENSOR_DEAD_MIN_PEAK && p < dz_max[s] - SENSOR_DEAD_DROP)
+    {
+        dz_ms[s] += dt_ms;
+        if (dz_ms[s] >= SENSOR_DEAD_CONFIRM_MS) { return SENSOR_ZONE_DEAD; }
+    }
+    else
+    {
+        dz_ms[s] = 0u;
+    }
+    return (p >= SENSOR_DEAD_MIN_PEAK) ? SENSOR_ZONE_PEAK : SENSOR_ZONE_OK;
+}
+
+int16_t sensors_dead_max(sensor_id_t s)
+{
+    return (s < SENSOR_COUNT) ? dz_max[s] : 0;
+}
+
+const char *sensors_zone_name(sensor_zone_t z)
+{
+    return (z == SENSOR_ZONE_DEAD) ? "MORTA" : (z == SENSOR_ZONE_PEAK) ? "pico" : "ok";
 }
 
 int16_t sensors_center_error(void)

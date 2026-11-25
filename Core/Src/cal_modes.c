@@ -12,6 +12,7 @@
 #include "motor.h"
 #include "debug.h"
 #include "ihm.h"
+#include "imu.h"
 
 #include <stdbool.h>
 #include <math.h>
@@ -118,6 +119,8 @@ static int32_t tc_st_mms_l   = 0, tc_st_mms_r   = 0;
 static bool    tc_st_valid   = false;
 
 static tc_state_t tc_state   = TC_INTRO;
+/* IMU como "transferidor" do TURN_CAL (21/11): mede quanto girou de verdade */
+static bool       tc_imu     = false;
 static uint32_t   tc_ms      = 0u;
 static int32_t    tc_target  = 0;
 static int        tc_done    = 0;
@@ -264,9 +267,32 @@ void turn_cal_update(void)
                                               / 1000u));
         }
 
+        if (tc_ms == (TURN_CAL_STRAIGHT_PAUSE - 1500u) && port_imu_ok())
+        {
+            port_debug_printf("    calibrando IMU -- NAO toque no robo\r\n");
+            tc_imu = port_imu_calibrate(1000u);
+            if (!tc_imu)
+            {
+                port_debug_printf("    IMU: variacao %d (max %d), erros I2C %lu -- tentando de novo\r\n",
+                                  (int)port_imu_get_cal_spread(), (int)IMU_CAL_MAX_SPREAD,
+                                  (unsigned long)port_imu_get_errors());
+                tc_imu = port_imu_calibrate(1000u);
+            }
+            if (!tc_imu && port_imu_get_cal_spread() < 1000)
+            {
+                /* aceita, mas avisa: o offset pode ter erro de ~1 grau/s */
+                port_debug_printf("    IMU: variacao %d -- aceita, medida APROXIMADA\r\n",
+                                  (int)port_imu_get_cal_spread());
+                tc_imu = true;
+            }
+            port_debug_printf("    IMU %s (variacao %d)\r\n", tc_imu ? "ok" : "FALHOU (giros sem medida)",
+                              (int)port_imu_get_cal_spread());
+        }
+
         if (tc_ms >= TURN_CAL_STRAIGHT_PAUSE)
         {
             speed_ctl_reset_odometry();
+            port_imu_reset_heading();
             tc_target = TURN_TICKS_PER_90;
             tc_done   = 0;
             port_debug_printf("\r\n--- giro 1/%d ---\r\n", (int)TURN_CAL_QUARTERS);
@@ -282,9 +308,16 @@ void turn_cal_update(void)
         if (mag <= (TURN_TICKS_PER_90 / 30))
         {
             tc_done++;
-            port_debug_printf("    parou com %ld ticks (alvo %ld)\r\n",
+            port_debug_printf("    parou com %ld ticks (alvo %ld)",
                               (long)speed_ctl_get_turn_ticks(),
                               (long)tc_target);
+            if (tc_imu)
+            {
+                port_debug_printf("  | IMU: %ld graus (ideal %d) erros I2C %lu",
+                                  (long)port_imu_get_heading_deg(), 90 * (tc_done),
+                                  (unsigned long)port_imu_get_errors());
+            }
+            port_debug_printf("\r\n");
             tc_enter((tc_done >= TURN_CAL_QUARTERS) ? TC_REPORT : TC_GAP);
             break;
         }
@@ -340,6 +373,18 @@ void turn_cal_update(void)
                 port_debug_printf("   medido: ESQ=%+ld  DIR=%+ld mm/s\r\n",
                                   (long)tc_st_mms_l, (long)tc_st_mms_r);
             }
+            if (tc_imu)
+            {
+                float g = fabsf(port_imu_get_heading_deg());
+                port_debug_printf("\r\n MEDIDO PELA IMU: %ld graus nos %d giros (ideal %d)\r\n",
+                                  (long)g, (int)TURN_CAL_QUARTERS, 90 * (int)TURN_CAL_QUARTERS);
+                if (g > 10.0f)
+                {
+                    port_debug_printf(" >>> TURN_TICKS_PER_90 sugerido = %ld  (atual %ld)\r\n",
+                                      (long)((float)TURN_TICKS_PER_90 * (90.0f * (float)TURN_CAL_QUARTERS) / g + 0.5f),
+                                      (long)TURN_TICKS_PER_90);
+                }
+            }
             port_debug_printf("\r\n Quanto ele girou DE VERDADE?\r\n");
             port_debug_printf("   voltou para a fita  -> esta' calibrado\r\n");
             port_debug_printf("   faltou para chegar  -> AUMENTE o numero\r\n");
@@ -367,6 +412,7 @@ void turn_cal_update(void)
         if (tc_ms >= TURN_CAL_REPORT_MS)
         {
             speed_ctl_reset_odometry();
+            port_imu_reset_heading();
             tc_target = TURN_TICKS_PER_90;
             tc_done   = 0;
             port_debug_printf("\r\n--- giro 1/%d ---\r\n", (int)TURN_CAL_QUARTERS);
@@ -411,6 +457,7 @@ static void oc_enter(oc_state_t s)
     {
     case OC_STRAIGHT:
         speed_ctl_reset_odometry();
+        speed_ctl_hold_mark();          /* a reta segura o rumo da largada */
         port_debug_printf("\r\n--- RETA: %ld mm comandados ---\r\n",
                           (long)ODOM_CAL_DISTANCE_MM);
         break;
@@ -504,7 +551,7 @@ void odom_cal_update(void)
             if (v < 60.0f) { v = 60.0f; }
         }
 
-        speed_ctl_set_vw(v, 0.0f);
+        speed_ctl_set_vw(v, speed_ctl_hold_turn());
         break;
     }
 

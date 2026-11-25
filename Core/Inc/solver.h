@@ -29,6 +29,7 @@
 
 #include "board.h"
 #include "maze.h"
+#include "sensors.h"
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -59,7 +60,7 @@
  * como a exploracao: celula a celula, mesma velocidade. Acelerar depois que
  * estiver confiavel: SOLVER_RUN_STRAIGHTS 1 e/ou SOLVER_RUN_MMS maior. */
 #define SOLVER_RUN_STRAIGHTS        0
-#define SOLVER_RUN_MMS              150.0f  /* 31o: 100 -> 120 ok; 32o: 120 -> 150 */
+#define SOLVER_RUN_MMS              342.0f  /* 24/11: 150 -> 180 (+20%) -> 342 (+90%) (31o: 100 -> 120 ok; 32o: 120 -> 150) */
 #define SOLVER_MIN_MMS              30.0f
 /* Freio: velocidade = MIN + ganho * distancia_restante (mm). 1,5/s da'
  * ~100 mm/s a 50 mm do fim. */
@@ -80,6 +81,63 @@
  * problema: ao sair ele ve' a frente chegar a 1000 logo, para sem ter saido
  * da celula e marca a parede (cells == 0 -> maze_force_wall). */
 #define SOLVER_FRONT_WALL_PROX      500     /* era 250 */
+
+/* --- MicroJM: PAREDE DA FRENTE PELO SHARP CENTRAL ------------------------ */
+/* Os numeros de frente acima (500, FR-E 1400/1445, FALIGN 1340/1395...) sao
+ * do robo F411, que tinha dois emissores apontados PARA A FRENTE em
+ * SENSOR_FRONT_L/R. No MicroJM esses dois canais sao os Sharp DIAGONAIS, que
+ * enxergam as paredes LATERAIS do corredor (teste 21/11, board.h): o solver
+ * via "parede na frente" em corredor aberto e, no ALINHA, andava ate' 50 mm
+ * para a frente em quase toda celula com parede do lado.
+ *   1 = frente so' pelo Sharp CENTRAL (SL5), com os limiares abaixo, que sao
+ *       os mesmos medidos no MicroJM em 21/11 (board.h);
+ *   0 = comportamento antigo (diagonais, numeros do F411). Codigo mantido. */
+#define SOLVER_FRONT_CENTRAL        1
+/* central parado no centro da celula: parede NESTA celula 550-900, parede
+ * UMA celula adiante 250-370 (21/11). Acima disto = parede na frente. */
+#define SOLVER_FRONT_WALL_C         SENSOR_FRONT_STOP       /* 400 */
+/* ponto de parada com parede na frente (o mesmo do modo MAZE) */
+#define SOLVER_FRONT_STOP_C         SENSOR_FRONT_CENTER     /* 800 (23/11) */
+/* parado com parede na frente e lendo abaixo disto: esta' curto, ALINHA
+ * anda devagar ate' SOLVER_FRONT_STOP_C (no maximo SOLVER_FALIGN_MAX_MM) */
+#define SOLVER_FALIGN_C_START       (SOLVER_FRONT_STOP_C - 60)
+/* andando: para pelo sensor so' nos ultimos WINDOW mm do encoder, ou na hora
+ * se a parede estiver praticamente colada */
+#define SOLVER_FRONT_WINDOW_C_MM    40.0f   /* (sem uso desde 24/11: ver APROXIMACAO) */
+
+/* APROXIMACAO DA PAREDE DA FRENTE (24/11), igual ao modo MAZE:
+ *  - em QUALQUER ponto do movimento, central >= SOLVER_FRONT_STOP_C (~2 cm)
+ *    -> para (antes so' valia nos ultimos 40 mm do encoder);
+ *  - acabou a distancia do encoder mas ha' parede na celula (central >
+ *    SOLVER_APPROACH_DETECT_C, ~8 cm) -> continua devagar ate' ~2 cm,
+ *    freando como o MAZE, no maximo SOLVER_APPROACH_MAX_MM a mais.
+ * Curva medida (central): 2 cm ~840, 4 cm ~452, 6 cm ~303, 8 cm ~178. */
+#define SOLVER_APPROACH_DETECT_C    170     /* ~8 cm                        */
+#define SOLVER_APPROACH_MAX_MM      70.0f   /* a mais que a distancia da celula */
+#define SOLVER_APPROACH_MIN_MMS     15.0f   /* abaixo disso a roda nao sai  */
+/* Com o GP2Y0A21 "colado" le' MENOS que no centro (curva cai abaixo de
+ * ~6 cm), entao este limite quase nunca e' atingido; quem protege contra
+ * passar do ponto e' a deteccao de ZONA MORTA (SENSOR_DEAD_*, board.h). */
+#define SOLVER_FRONT_GLUED_C        1000
+
+/* --- LATERAL NA DUVIDA (23/11) ------------------------------------------- */
+/* Testes 23/11 no DECIDE_TEST: parede lateral de verdade leu 685-1480;
+ * lado aberto 0-395; mas com o robo TORTO (levou um toque) o lado aberto
+ * leu 535-585 -- o Sharp via de vies a ponta da parede/pino da celula
+ * vizinha. Com um limiar so' (550) a decisao ficava trocando entre DIREITA
+ * e MEIA-VOLTA.
+ * Agora, na hora de MAPEAR (parado no centro):
+ *   prox >= WALL_MIN      -> parede (vota)
+ *   prox <= OPEN_MAX      -> aberto (vota)
+ *   entre os dois         -> "nao sei": nao vota. Para decidir, lado nao
+ *                            visto conta como aberto; se ele virar para la'
+ *                            e for parede, o Sharp central ve' ao sair e
+ *                            marca a parede (maze_force_wall).
+ * O centralizador (andando) continua com SENSOR_WALL_THRESHOLD do board.h.
+ * 0 = desliga (volta ao limiar unico). */
+#define SOLVER_SIDE_UNSURE          1
+#define SOLVER_SIDE_OPEN_MAX        420
+#define SOLVER_SIDE_WALL_MIN        600     /* 23/11: parede real centralizada leu 640-660 (era 650) */
 
 /* Ao fim da distancia, se o frontal ainda ve' a parede chegando mas nao
  * atingiu o centro, avanca devagar ate' atingir -- no maximo isto. */
@@ -293,7 +351,11 @@
 /* Peso do "segurar rumo" do giroscopio quando ha' parede do lado (0..1). */
 #define SOLVER_HEADING_WALL_SHARE   0.3f
 /* Recalibra laterais (centro) e frontais (aberto) na largada, com a luz atual. */
-#define SOLVER_START_AUTOCAL        1
+/* 23/11: 0 no MicroJM. A conta (lateral "perto" se cru < longe - 300,
+ * frontal "longe" se cru > perto + 800) e' dos sensores do F411, cujo valor
+ * cru CAI com a parede perto. Nos Sharp o cru SOBE: nunca disparava e, se
+ * disparasse, gravaria a calibracao ao contrario. */
+#define SOLVER_START_AUTOCAL        0   /* era 1 */
 #define SOLVER_SIDE_CLOSE_PROX      1200
 
 void solver_init(void);
@@ -309,3 +371,47 @@ bool solver_aborted(void);
 
 /** @brief Imprime o registro passo a passo e o mapa. */
 void solver_dump(void);
+
+/** @brief A regra de "parede na frente" que o solver usa (para os testes). */
+bool solver_front_wall_seen(void);
+
+/** @brief Lateral como o solver mapeia: 1 parede, 0 aberto, -1 na duvida. */
+int8_t solver_side_wall(sensor_id_t s);
+
+/** @brief Imprime uma linha [DEC] por decisao: Sharp, distancias das
+ *         vizinhas e o giro escolhido. Chamar antes de solver_init(). */
+void solver_set_decision_log(bool on);
+
+/** @brief true = para no centro (so' a exploracao). Antes de solver_init(). */
+void solver_set_explore_only(bool on);
+
+/* --- MODO LOCAL (APP_MODE_LOCAL_TEST, 24/11) ----------------------------- */
+/* Anda igual ao solver (celula a celula, para no centro, le' os Sharp), mas
+ * decide SO' pelo que ve' nesta celula: sem mapa, sem bordas, sem alvo.
+ * Serve para validar sensores, giros e movimento antes da resolucao.
+ * Ordem de preferencia entre os lados ABERTOS:
+ *   1 = direita, frente, esquerda   ("mao direita": segue a parede da esq.)
+ *   2 = esquerda, frente, direita   ("mao esquerda")
+ *   0 = frente, direita, esquerda
+ * Lado "na duvida" (faixa SOLVER_SIDE_*) so' e' usado se nenhum lado estiver
+ * aberto com certeza. Nada aberto -> meia-volta. */
+/* Pausas de decisao SO' no modo local (24/11: -50% para teste).
+ * No SOLVE/DECIDE_TEST_MOTOR continuam SOLVER_SETTLE_MS, SOLVER_TURN_PAUSE_MS
+ * e SOLVER_TURN_SETTLE_MS. */
+#define SOLVER_LOCAL_SETTLE_MS      125u    /* parado antes de ler paredes (250) */
+#define SOLVER_LOCAL_TURN_PAUSE_MS  75u     /* parado antes de girar       (150) */
+#define SOLVER_LOCAL_TURN_SETTLE_MS 75u     /* conferindo o fim do giro    (150) */
+
+/* Velocidade SO' no modo local (24/11: +70% sobre SPEED_CRUISE_MMS 228).
+ * A frenagem do solver e' v = MIN + GANHO * (mm que faltam): com o ganho 1,5
+ * uma celula de 180 mm nunca passaria de ~300 mm/s. Com 2,5 ele chega aos
+ * 388 e comeca a frear a ~143 mm do fim. */
+#define SOLVER_LOCAL_MMS            388.0f
+#define SOLVER_LOCAL_BRAKE_GAIN     2.5f
+
+#ifndef SOLVER_LOCAL_PREFER
+#define SOLVER_LOCAL_PREFER         1
+#endif
+
+/** @brief Liga o modo local (decisao so' pelos sensores). Antes de solver_init(). */
+void solver_set_local_mode(bool on);

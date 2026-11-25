@@ -171,6 +171,17 @@ bool nav_finished(void);
  * 0 = esquerda, 1 = direita */
 #define NAV_PREFER_RIGHT        0
 
+/* LATERAL NA DUVIDA na hora de escolher o giro (23/11). Parede de verdade
+ * le' 685+, aberto ate' ~395, mas um lado ABERTO visto de vies (robo torto)
+ * le' 530-590 -- logo acima do SENSOR_WALL_THRESHOLD (550). Assim o robo
+ * achou "beco sem saida" com ESQ 557 e deu meia-volta. Agora:
+ *   >= WALL_MIN parede | <= OPEN_MAX aberto | entre os dois: duvida.
+ * Escolha: lado ABERTO certo primeiro; senao, lado na DUVIDA (tenta -- se
+ * for parede, o frontal ve' ao sair e ele decide de novo); meia-volta so'
+ * com os dois lados parede certa. Mesmos numeros do solver.h. */
+#define NAV_SIDE_OPEN_MAX       420
+#define NAV_SIDE_WALL_MIN       600     /* 23/11: parede real leu 640-660 (era 650) */
+
 /* Distancia sem nenhuma parede que caracteriza a saida do labirinto */
 #define NAV_EXIT_OPEN_MM        250.0f
 

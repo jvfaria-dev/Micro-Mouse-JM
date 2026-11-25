@@ -374,6 +374,25 @@ int32_t speed_ctl_get_turn_ticks(void)
     return odo_ticks_r - odo_ticks_l;
 }
 
+/* Rumo pelos encoders (SPEED_HOLD_KP no board.h) */
+static int32_t hold_ref = 0;
+
+void speed_ctl_hold_mark(void)
+{
+    hold_ref = odo_ticks_r - odo_ticks_l;
+}
+
+float speed_ctl_hold_turn(void)
+{
+    /* + = roda direita andou mais = robo virou p/ a esquerda -> volta p/ a
+     * direita (turn negativo acelera a esquerda e freia a direita) */
+    float err_mm = (float)((odo_ticks_r - odo_ticks_l) - hold_ref) * MM_PER_TICK;
+    float t = -SPEED_HOLD_KP * err_mm;
+    if (t >  SPEED_HOLD_MAX_MMS) { t =  SPEED_HOLD_MAX_MMS; }
+    if (t < -SPEED_HOLD_MAX_MMS) { t = -SPEED_HOLD_MAX_MMS; }
+    return t;
+}
+
 int32_t speed_ctl_get_fwd_ticks(void)
 {
     return (odo_ticks_r + odo_ticks_l) / 2;

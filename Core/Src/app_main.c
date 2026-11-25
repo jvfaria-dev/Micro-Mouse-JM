@@ -11,6 +11,11 @@
  * disso (alguma espera longa de proposito), realinha o relogio. */
 #define APP_MAX_CATCHUP_MS      20u
 
+/* Linha ao vivo dos 5 Sharp no MAZE (diagnostico; 0 desliga). */
+#ifndef NAV_LIVE_SENSORS
+#define NAV_LIVE_SENSORS        1
+#endif
+
 /* Se o board.h no disco for uma versao antiga (sem esta linha), compila do
  * mesmo jeito e o cabecalho do boot denuncia. */
 #ifndef BOARD_MAP_DESC
@@ -37,6 +42,8 @@ static void task_control(void)
     encoder_cal_update();
 #elif (APP_MODE == APP_MODE_IMU_TEST)
     /* motores parados */
+#elif (APP_MODE == APP_MODE_DECIDE_TEST)
+    /* motores parados */
 #else
     speed_ctl_update();
 #endif
@@ -45,10 +52,12 @@ static void task_control(void)
 /* --- sensores, 200 Hz ----------------------------------------------------- */
 static void task_sensors(void)
 {
-#if APP_USES_NAV || (APP_MODE == APP_MODE_SOLVE)
+#if APP_USES_NAV || (APP_MODE == APP_MODE_SOLVE) || (APP_MODE == APP_MODE_DECIDE_TEST) \
+    || (APP_MODE == APP_MODE_DECIDE_TEST_MOTOR) || (APP_MODE == APP_MODE_LOCAL_TEST)
     port_sensors_update();
-#if (APP_MODE == APP_MODE_SOLVE)
-    port_imu_update(SENSOR_PERIOD_MS);      /* giroscopio, 200 Hz */
+#if (APP_MODE == APP_MODE_SOLVE) || (APP_MODE == APP_MODE_MAZE) || (APP_MODE == APP_MODE_TURN_CAL) \
+    || (APP_MODE == APP_MODE_DECIDE_TEST_MOTOR) || (APP_MODE == APP_MODE_LOCAL_TEST)
+    port_imu_update(SENSOR_PERIOD_MS);      /* giroscopio, 200 Hz (MAZE: giros pela IMU) */
 #endif
 #elif (APP_MODE == APP_MODE_IMU_TEST)
     imu_test_update();
@@ -68,6 +77,12 @@ static void task_nav(void)
     nav_update();
 #elif (APP_MODE == APP_MODE_SOLVE)
     solver_update();
+#elif (APP_MODE == APP_MODE_DECIDE_TEST)
+    decide_test_update();
+#elif (APP_MODE == APP_MODE_DECIDE_TEST_MOTOR)
+    decide_test_motor_update();
+#elif (APP_MODE == APP_MODE_LOCAL_TEST)
+    decide_test_local_update();
 #endif
 }
 
@@ -89,6 +104,18 @@ static bool     tr_dumped   = false;
 
 static void task_telemetry(void)
 {
+#if NAV_LIVE_SENSORS
+    port_debug_printf("%-8s| ESQ %4u/%4d | FE %4u/%4d | CEN %4u/%4d | FD %4u/%4d | DIR %4u/%4d | par E%d F%d D%d\r\n",
+                      nav_state_name(),
+                      (unsigned)port_sensors_get_raw_filtered(SENSOR_LEFT),    (int)port_sensors_get_prox(SENSOR_LEFT),
+                      (unsigned)port_sensors_get_raw_filtered(SENSOR_FRONT_L), (int)port_sensors_get_prox(SENSOR_FRONT_L),
+                      (unsigned)port_sensors_get_raw_filtered(SENSOR_FRONT),   (int)port_sensors_get_prox(SENSOR_FRONT),
+                      (unsigned)port_sensors_get_raw_filtered(SENSOR_FRONT_R), (int)port_sensors_get_prox(SENSOR_FRONT_R),
+                      (unsigned)port_sensors_get_raw_filtered(SENSOR_RIGHT),   (int)port_sensors_get_prox(SENSOR_RIGHT),
+                      port_sensors_wall(SENSOR_LEFT) ? 1 : 0,
+                      port_sensors_wall_ahead() ? 1 : 0,
+                      port_sensors_wall(SENSOR_RIGHT) ? 1 : 0);
+#endif
     int32_t fwd  = speed_ctl_get_fwd_ticks();
     int32_t move = fwd - tr_last_fwd;
     tr_last_fwd = fwd;
@@ -159,7 +186,8 @@ static void task_telemetry(void)
 {
     imu_test_print();
 }
-#elif (APP_MODE == APP_MODE_SOLVE)
+#elif (APP_MODE == APP_MODE_SOLVE) || (APP_MODE == APP_MODE_DECIDE_TEST_MOTOR) \
+    || (APP_MODE == APP_MODE_LOCAL_TEST)
 /* O registro e o mapa saem UMA vez, 3 s depois do fim. Depois so' de novo
  * quando o terminal (re)abre a porta -- nunca sozinho. RESET apaga. */
 static uint32_t sv_idle_ms = 0u;
@@ -246,6 +274,9 @@ static const char *mode_name(void)
         case APP_MODE_TURN_CAL:    return "TURN_CAL";
         case APP_MODE_IMU_TEST:    return "IMU_TEST";
         case APP_MODE_SOLVE:       return "SOLVE";
+        case APP_MODE_DECIDE_TEST: return "DECIDE_TEST";
+        case APP_MODE_DECIDE_TEST_MOTOR: return "DECIDE_TEST_MOTOR";
+        case APP_MODE_LOCAL_TEST:  return "LOCAL_TEST";
         default:                   return "?";
     }
 }
@@ -310,6 +341,12 @@ void app_init(void)
     imu_test_init();
 #elif (APP_MODE == APP_MODE_SOLVE)
     solver_init();
+#elif (APP_MODE == APP_MODE_DECIDE_TEST)
+    decide_test_init();
+#elif (APP_MODE == APP_MODE_DECIDE_TEST_MOTOR)
+    decide_test_motor_init();
+#elif (APP_MODE == APP_MODE_LOCAL_TEST)
+    decide_test_local_init();
 #endif
 
     last_ms = HAL_GetTick();

@@ -18,6 +18,51 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+/* "Parede perto na frente" (desencalhe) e "desacelera" -- ver
+ * SOLVER_FRONT_CENTRAL em solver.h */
+#if (SOLVER_FRONT_CENTRAL != 0)
+#define FRONT_NEAR_PROX     SOLVER_FRONT_WALL_C
+#define FRONT_SLOW_PROX     SOLVER_FRONT_WALL_C
+#else
+#define FRONT_NEAR_PROX     SOLVER_CREEP_DETECT_PROX
+#define FRONT_SLOW_PROX     SOLVER_NEAR_WALL_PROX
+#endif
+
+/* Zona morta do Sharp central (24/11, SENSOR_DEAD_* no board.h) */
+static int16_t front_min(void);
+static bool    front_peaked = false;     /* recuou nesta celula: nao alinha */
+static int16_t db_start = 0, db_max = 0; /* recuo da zona morta              */
+static int32_t db_fwd0  = 0;
+
+static void front_peak_reset(void)
+{
+    sensors_dead_reset(SENSOR_FRONT);
+}
+
+/* true: entrou na zona morta (passou do pico, mais perto que ~1,3 cm) */
+static bool front_peak_passed(int16_t f)
+{
+    (void)f;
+    return sensors_dead_update(SENSOR_FRONT, NAV_PERIOD_MS) == SENSOR_ZONE_DEAD;
+}
+
+static void begin_deadback(void)
+{
+    speed_ctl_stop();
+    front_peaked = true;
+    db_start = front_min();
+    db_max   = db_start;
+    db_fwd0  = speed_ctl_get_fwd_ticks();
+    speed_ctl_hold_mark();
+    port_debug_printf("zona morta frontal: max %d agora %d -> recua\r\n",
+                      (int)sensors_dead_max(SENSOR_FRONT), (int)db_start);
+}
+
+/* modos de teste (APP_MODE_DECIDE_TEST_MOTOR) */
+static bool dec_log      = false;
+static bool local_mode   = false;   /* APP_MODE_LOCAL_TEST: sem mapa */
+static bool explore_only = false;
+
 /* ===========================================================================
  * Estado
  * ======================================================================== */
@@ -32,13 +77,14 @@ typedef enum
     ST_PAUSE,       /* pausa entre fases                        */
     ST_DONE,
     ST_ABORT,
-    ST_UNSTICK      /* recua um pouco e retoma o que fazia      */
+    ST_UNSTICK,     /* recua um pouco e retoma o que fazia      */
+    ST_DEADBACK     /* zona morta do Sharp frontal: recua (24/11) */
 } st_t;
 
 typedef enum { PH_EXPLORE = 0, PH_RETURN, PH_RUN } phase_t;
 
 static const char *const st_name[] =
-    { "ESPERA", "LE", "GIRA", "ANDA", "ALINHA", "PAUSA", "FIM", "ABORTOU", "DESENCALHA" };
+    { "ESPERA", "LE", "GIRA", "ANDA", "ALINHA", "PAUSA", "FIM", "ABORTOU", "DESENCALHA", "RECUA-ZM" };
 static const char *const ph_name[] = { "EXPLORA", "VOLTA", "CORRE" };
 static const char dir_ch[4] = { 'N', 'L', 'S', 'O' };   /* norte leste sul oeste */
 
@@ -176,7 +222,9 @@ static float head_turn(void)
 {
     if (!use_imu)
     {
-        return 0.0f;
+        /* 23/11: sem giroscopio, segura o rumo pelos encoders (a marca e'
+         * feita na saida de cada movimento e enquanto ha' parede do lado) */
+        return speed_ctl_hold_turn();
     }
     float t = head_err() * SOLVER_HEADING_KP;
     if (t >  SOLVER_HEADING_MAX_MMS) { t =  SOLVER_HEADING_MAX_MMS; }
@@ -251,6 +299,10 @@ static void drive_centered(float v)
         wf_prev  = e;
         wf_deriv += (de - wf_deriv) * WALL_FOLLOW_D_ALPHA;
         turn = (e * WALL_FOLLOW_KP) + (wf_deriv * WALL_FOLLOW_KD);
+        if (!use_imu)
+        {
+            speed_ctl_hold_mark();      /* parede confirma o rumo (sem gyro) */
+        }
 
         /* Com parede do lado, quem manda e' a parede. A referencia de rumo
          * do giroscopio vai sendo puxada para o rumo atual -- devagar com
@@ -305,11 +357,30 @@ static float move_boost(float v)
     return (v > SOLVER_MOVE_BOOST_MAX_MMS) ? SOLVER_MOVE_BOOST_MAX_MMS : v;
 }
 
+/* Alvo pela DIP SW1-1 (board.h): false = centro, true = canto oposto */
+static bool goal_corner = false;
+
+static bool dip_goal_corner(void)
+{
+    GPIO_PinState st = HAL_GPIO_ReadPin(BOARD_DIP_GOAL_PORT, BOARD_DIP_GOAL_PIN);
+#if (BOARD_DIP_ACTIVE_LOW != 0)
+    return st == GPIO_PIN_RESET;        /* chave ON puxa para o GND */
+#else
+    return st == GPIO_PIN_SET;
+#endif
+}
+
 static void set_target_for_phase(void)
 {
     if (phase == PH_RETURN)
     {
         maze_target_cell(sx, sy);
+    }
+    else if (goal_corner)
+    {
+        /* canto oposto a' largada, na diagonal: outra coluna da borda e a
+         * ultima linha (a largada fica sempre na linha y = 0) */
+        maze_target_cell((uint8_t)(MAZE_W - 1u - sx), (uint8_t)(MAZE_H - 1u));
     }
     else
     {
@@ -336,7 +407,7 @@ static void begin_unstick(const char *why)
 {
     int32_t dl = ticks_l() - st_l0;
     int32_t dr = ticks_r() - st_r0;
-    int16_t f  = port_sensors_front();
+    int16_t f  = front_min();
 
     /* uma linha so': estado, celula, motivo | ticks E/D | duty E/D |
      * frente (FE/FD) | lateral esq/dir */
@@ -367,7 +438,7 @@ static void begin_unstick(const char *why)
      * parede perto na frente, senao foi a traseira que encostou -- avanca. */
     /* Girando com a frente livre: alterna avanca / recua a cada tentativa
      * (8o teste: preso no giro com parede colada de lado, avancou 3x igual). */
-    if (st != ST_TURN || f > SOLVER_CREEP_DETECT_PROX)
+    if (st != ST_TURN || f > FRONT_NEAR_PROX)
     {
         unstick_dir = -1.0f;
     }
@@ -382,7 +453,7 @@ static void begin_unstick(const char *why)
     us_ms    = 0u;
 #if (SOLVER_SIDESTEP != 0)
     /* andando, nada na frente: quina do chassi num pino -> desvia de lado */
-    if (use_imu && st == ST_MOVE && front_min() < SOLVER_CREEP_DETECT_PROX
+    if (use_imu && st == ST_MOVE && front_min() < FRONT_NEAR_PROX
         && !(port_sensors_wall(SENSOR_LEFT) && port_sensors_wall(SENSOR_RIGHT)))
     {
         int16_t pl  = port_sensors_get_prox(SENSOR_LEFT);
@@ -448,6 +519,9 @@ static void start_move(void)
     wf_prev = 0.0f; wf_deriv = 0.0f;
     edge_l = side_state(SENSOR_LEFT,  port_sensors_wall(SENSOR_LEFT));
     edge_r = side_state(SENSOR_RIGHT, port_sensors_wall(SENSOR_RIGHT));
+    speed_ctl_hold_mark();
+    front_peak_reset();
+    front_peaked = false;
     enter(ST_MOVE);
 }
 
@@ -546,14 +620,24 @@ static void edge_fix(bool rising)
  * FR-E 306, FR-D 217 com o corredor vazio) bastava para "fechar" a frente. */
 static int16_t front_min(void)
 {
+#if (SOLVER_FRONT_CENTRAL != 0)
+    /* MicroJM: a "frente" e' o Sharp CENTRAL. Os diagonais (FRONT_L/R)
+     * enxergam as paredes laterais e nao servem para isto (solver.h). */
+    return port_sensors_get_prox(SENSOR_FRONT);
+#else
     int16_t a = port_sensors_get_prox(SENSOR_FRONT_L);
     int16_t b = port_sensors_get_prox(SENSOR_FRONT_R);
     return (a < b) ? a : b;
+#endif
 }
 
 static bool front_wall_seen(void)
 {
+#if (SOLVER_FRONT_CENTRAL != 0)
+    return front_min() > SOLVER_FRONT_WALL_C;
+#else
     return front_min() > SOLVER_FRONT_WALL_PROX;
+#endif
 }
 
 static void begin_turn(int quarters)        /* + = esquerda */
@@ -564,6 +648,96 @@ static void begin_turn(int quarters)        /* + = esquerda */
     turn_gh0     = gyro_head();
     settle_ms    = 0u;
     enter(ST_TURN);
+}
+
+/* Uma linha por decisao (APP_MODE_DECIDE_TEST_MOTOR):
+ *   [DEC] E1 F0 D1 | E 812 FE 140 C 95 FD 133 D 790 | F:3 D:# E:# T:5 -> RETO (N)
+ * F/D/E/T = distancia ao alvo da vizinha da Frente/Direita/Esquerda/Tras pelo
+ * flood que acabou de rodar ('#' parede, '-' sem caminho por ali). */
+/* lateral para o MAPA: 1 parede, 0 aberto, -1 duvida (ver solver.h) */
+static int8_t side_tri(sensor_id_t s)
+{
+#if (SOLVER_SIDE_UNSURE != 0)
+    int16_t p = port_sensors_get_prox(s);
+    if (p >= SOLVER_SIDE_WALL_MIN) { return 1; }
+    if (p <= SOLVER_SIDE_OPEN_MAX) { return 0; }
+    return -1;
+#else
+    return port_sensors_wall(s) ? 1 : 0;
+#endif
+}
+
+static char tri_ch(int8_t t)
+{
+    return (t < 0) ? '?' : (t ? '1' : '0');
+}
+
+/* Pausas: mais curtas no modo local (solver.h, SOLVER_LOCAL_*_MS) */
+static uint32_t settle_time(void)     { return local_mode ? SOLVER_LOCAL_SETTLE_MS      : SOLVER_SETTLE_MS; }
+static uint32_t turn_pause_time(void) { return local_mode ? SOLVER_LOCAL_TURN_PAUSE_MS  : SOLVER_TURN_PAUSE_MS; }
+static uint32_t turn_settle_time(void){ return local_mode ? SOLVER_LOCAL_TURN_SETTLE_MS : SOLVER_TURN_SETTLE_MS; }
+
+/* MODO LOCAL: escolhe a direcao (absoluta) so' pelos sensores desta celula.
+ * Ordem: SOLVER_LOCAL_PREFER (solver.h). Abertos com certeza primeiro; lado
+ * na duvida so' se nenhum estiver aberto; nada aberto -> meia-volta. */
+static maze_dir_t local_decide(int8_t tl, bool wf, int8_t tr)
+{
+    /* rel: 0 frente, 1 direita, 3 esquerda */
+#if (SOLVER_LOCAL_PREFER == 1)
+    static const int order[3] = { 1, 0, 3 };
+#elif (SOLVER_LOCAL_PREFER == 2)
+    static const int order[3] = { 3, 0, 1 };
+#else
+    static const int order[3] = { 0, 1, 3 };
+#endif
+    for (int pass = 0; pass < 2; pass++)
+    {
+        int8_t want = (pass == 0) ? 0 : -1;     /* 0 = aberto, -1 = duvida */
+        for (int i = 0; i < 3; i++)
+        {
+            int8_t t = (order[i] == 0) ? (wf ? 1 : 0)
+                     : (order[i] == 1) ? tr : tl;
+            if (t == want)
+            {
+                return (maze_dir_t)((ch + order[i]) & 3);
+            }
+        }
+    }
+    return (maze_dir_t)((ch + 2) & 3);          /* meia-volta */
+}
+
+static void print_decision(int8_t tl, bool wf, int8_t tr, bool pess)
+{
+    static const char *const qn[4] = { "RETO", "DIREITA", "MEIA-VOLTA", "ESQUERDA" };
+    const maze_dir_t side[4] = { ch, (maze_dir_t)((ch + 1) & 3),
+                                 (maze_dir_t)((ch + 3) & 3), (maze_dir_t)((ch + 2) & 3) };
+    const char tag[4] = { 'F', 'D', 'E', 'T' };
+
+    port_debug_printf("  [DEC] E%c F%d D%c | E %d FE %d C %d FD %d D %d |",
+                      tri_ch(tl), wf ? 1 : 0, tri_ch(tr),
+                      (int)port_sensors_get_prox(SENSOR_LEFT),
+                      (int)port_sensors_get_prox(SENSOR_FRONT_L),
+                      (int)port_sensors_get_prox(SENSOR_FRONT),
+                      (int)port_sensors_get_prox(SENSOR_FRONT_R),
+                      (int)port_sensors_get_prox(SENSOR_RIGHT));
+    for (int i = 0; i < 4; i++)
+    {
+        uint8_t nx = cx, ny = cy;
+        if (maze_wall(cx, cy, side[i]) || !maze_step(&nx, &ny, side[i]))
+        {
+            port_debug_printf(" %c:#", tag[i]);
+        }
+        else if (maze_dist(nx, ny) == MAZE_DIST_INF)
+        {
+            port_debug_printf(" %c:-", tag[i]);
+        }
+        else
+        {
+            port_debug_printf(" %c:%u", tag[i], (unsigned)maze_dist(nx, ny));
+        }
+    }
+    port_debug_printf(" -> %s (%c)%s\r\n", qn[((int)want_dir - (int)ch) & 3],
+                      dir_ch[want_dir], (phase == PH_RUN && !pess) ? " otimista" : "");
 }
 
 static void sense_and_decide(void)
@@ -583,7 +757,7 @@ static void sense_and_decide(void)
      * O lado para onde ele ficar virado passa a ser o "N" -- o mapa nao muda. */
     if (!start_checked && phase == PH_EXPLORE && steps == 0 && cx == sx && cy == sy)
     {
-        int16_t f = port_sensors_front();
+        int16_t f = front_min();
         start_checked = true;
         port_debug_printf("LARGADA sens E%d FE%d FD%d D%d (cru %u %u %u %u)\r\n",
                           port_sensors_get_prox(SENSOR_LEFT),
@@ -597,7 +771,14 @@ static void sense_and_decide(void)
         int quarters = 0;
         if (wl && wr)
         {
+#if (SOLVER_FRONT_CENTRAL != 0)
+            /* central: parede colada le' 550-900, aberta <= 370. O antigo
+             * ">= SOLVER_ALIGN_LO (850)" era do F411 -- no MicroJM quase
+             * nunca passava e o robo largava de costas contra a parede. */
+            if (wf)
+#else
             if (f >= SOLVER_ALIGN_LO)
+#endif
             {
                 quarters = 2;                   /* de costas para a saida */
             }
@@ -651,23 +832,28 @@ static void sense_and_decide(void)
         }
     }
 
+    /* lateral para o MAPA, com faixa de duvida (solver.h) */
+    int8_t tl = side_tri(SENSOR_LEFT);
+    int8_t tr = side_tri(SENSOR_RIGHT);
+
     /* Leu ABERTO onde a parede e' certa (borda externa / largada)? Entao o
      * robo nao esta' onde acha que esta' -- avisa no log (teste 7: em (4,0)
      * virado p/ S leu frente aberta, mas ali e' a borda). */
     {
         maze_dir_t dl = (maze_dir_t)((ch + 3) & 3);
         maze_dir_t dr = (maze_dir_t)((ch + 1) & 3);
-        if ((!wl && maze_wall_locked(cx, cy, dl)) ||
-            (!wf && maze_wall_locked(cx, cy, ch)) ||
-            (!wr && maze_wall_locked(cx, cy, dr)))
+        if (!local_mode &&
+            ((tl == 0 && maze_wall_locked(cx, cy, dl)) ||
+             (!wf && maze_wall_locked(cx, cy, ch)) ||
+             (tr == 0 && maze_wall_locked(cx, cy, dr))))
         {
             port_debug_printf("AVISO %u,%u %c: aberto onde a parede e' certa (E%d F%d D%d)\r\n",
                               cx, cy, dir_ch[ch], port_sensors_get_prox(SENSOR_LEFT),
-                              (int)port_sensors_front(), port_sensors_get_prox(SENSOR_RIGHT));
+                              (int)front_min(), port_sensors_get_prox(SENSOR_RIGHT));
         }
     }
 
-    maze_set_walls(cx, cy, ch, wl, wf, wr);
+    maze_set_walls3(cx, cy, ch, tl, wf ? 1 : 0, tr);
     unstick_cell = 0u;              /* chegou numa celula: zera tentativas */
 
     log_t *e = (lg_n < LOG_N) ? &lg[lg_n] : NULL;
@@ -680,10 +866,46 @@ static void sense_and_decide(void)
         lg_n++;
     }
 
+    /* --- MODO LOCAL: so' sensores, sem mapa/alvo (APP_MODE_LOCAL_TEST) --- */
+    if (local_mode)
+    {
+        static const char *const qn[4] = { "RETO", "DIREITA", "MEIA-VOLTA", "ESQUERDA" };
+        if (++steps > SOLVER_MAX_STEPS)
+        {
+            do_abort("passos demais (trava de seguranca)");
+            return;
+        }
+        want_dir   = local_decide(tl, wf, tr);
+        move_cells = 1u;
+        if (e != NULL) { e->dir = (uint8_t)want_dir; e->n = 1u; }
+        port_debug_printf("LOCAL #%d  E%c F%d D%c | E %d FE %d C %d FD %d D %d -> %s",
+                          steps, tri_ch(tl), wf ? 1 : 0, tri_ch(tr),
+                          (int)port_sensors_get_prox(SENSOR_LEFT),
+                          (int)port_sensors_get_prox(SENSOR_FRONT_L),
+                          (int)port_sensors_get_prox(SENSOR_FRONT),
+                          (int)port_sensors_get_prox(SENSOR_FRONT_R),
+                          (int)port_sensors_get_prox(SENSOR_RIGHT),
+                          qn[((int)want_dir - (int)ch) & 3]);
+        if (mv_raw_mm >= 0)
+        {
+            port_debug_printf("  (andou %d mm)", (int)mv_raw_mm);
+            mv_raw_mm = -1;
+        }
+        port_debug_printf("\r\n");
+        goto local_turn;
+    }
+
     /* --- troca de fase --- */
     if (phase == PH_EXPLORE && maze_is_target(cx, cy))
     {
         port_debug_printf("CHEGOU %u,%u em %d passos\r\n", cx, cy, steps);
+        if (explore_only)
+        {
+            speed_ctl_stop();
+            port_ihm_led_set(true);
+            enter(ST_DONE);
+            return;
+        }
         phase = PH_RETURN;
         set_target_for_phase();
         port_ihm_led_blink(500u);
@@ -733,7 +955,20 @@ static void sense_and_decide(void)
          * confere de perto o que tinha lido mal. */
         port_debug_printf("sem caminho: esquece leituras fracas\r\n");
         maze_forget_weak();
-        maze_set_walls(cx, cy, ch, wl, wf, wr);
+        maze_set_walls3(cx, cy, ch, tl, wf ? 1 : 0, tr);
+        pess = false;
+        maze_flood(false);
+        d = maze_next_dir(cx, cy, ch, false);
+    }
+    for (int k = 0; (k < 3) && (d < 0); k++)
+    {
+        /* 23/11 (simulacao com o maze.c, 3000 labirintos, 5% de leitura
+         * errada): parede fantasma lida 2x tem voto 2, o forget_weak nao a
+         * apaga e o robo abortava. Tira um voto de tudo que nao e' travado
+         * ate' abrir caminho; o que for parede de verdade e' relido. */
+        port_debug_printf("sem caminho: enfraquece votos (%d)\r\n", k + 1);
+        maze_weaken();
+        maze_set_walls3(cx, cy, ch, tl, wf ? 1 : 0, tr);
         pess = false;
         maze_flood(false);
         d = maze_next_dir(cx, cy, ch, false);
@@ -757,14 +992,19 @@ static void sense_and_decide(void)
         e->n   = move_cells;
     }
 
+    if (dec_log)
+    {
+        print_decision(tl, wf, tr, pess);
+    }
+
     /* Uma linha curta por celula (legenda no cabecalho):
      *   E 5,0 N 101 d4>N         fase, celula, rumo, paredes Esq/Frente/Dir,
      *                            distancia ao alvo > proxima direcao (xN = retas)
      *   180 b1+3                 ultimo movimento: encoder cru em mm, bordas
      *                            usadas e soma das correcoes delas (mm) */
-    port_debug_printf("%c %u,%u %c %d%d%d d%u>%c",
+    port_debug_printf("%c %u,%u %c %c%d%c d%u>%c",
                       ph_name[phase][0], cx, cy, dir_ch[ch],
-                      wl ? 1 : 0, wf ? 1 : 0, wr ? 1 : 0,
+                      tri_ch(tl), wf ? 1 : 0, tri_ch(tr),
                       (unsigned)maze_dist(cx, cy), dir_ch[want_dir]);
     if (move_cells > 1u)
     {
@@ -780,8 +1020,12 @@ static void sense_and_decide(void)
     {
         /* parede na frente: leitura dos dois frontais parado aqui (calibrar
          * o "centro" -- 17o teste: parar em 1000 era ~30 mm antes) */
+#if (SOLVER_FRONT_CENTRAL != 0)
+        port_debug_printf(" F%d", (int)front_min());
+#else
         port_debug_printf(" F%d/%d", port_sensors_get_prox(SENSOR_FRONT_L),
                           port_sensors_get_prox(SENSOR_FRONT_R));
+#endif
     }
     {
         /* lateral em zona duvidosa: imprime os dois (diagnostico de luz) */
@@ -807,6 +1051,8 @@ static void sense_and_decide(void)
     }
     port_debug_printf("\r\n");
 
+local_turn:
+    ;
     int q = ((int)want_dir - (int)ch) & 3;     /* 0 reto, 1 dir, 2 re', 3 esq */
     if (q == 0)
     {
@@ -844,6 +1090,7 @@ void solver_init(void)
     maze_set_start(sx, sy);
 
     phase = PH_EXPLORE;
+    goal_corner = dip_goal_corner();
     set_target_for_phase();
     steps = 0;
     lg_n  = 0u;
@@ -882,6 +1129,15 @@ void solver_init(void)
                       (MAZE_START_OUTER_RIGHT != 0) ? "dir" : "esq",
                       (long)TICKS_PER_CELL, (long)TURN_TICKS_PER_90,
                       (unsigned long)(SOLVER_START_DELAY_MS / 1000u));
+    if (goal_corner)
+    {
+        port_debug_printf("ALVO (DIP SW1-1 ON): canto oposto %u,%u\r\n",
+                          (unsigned)(MAZE_W - 1u - sx), (unsigned)(MAZE_H - 1u));
+    }
+    else
+    {
+        port_debug_printf("ALVO (DIP SW1-1 OFF): centro do labirinto\r\n");
+    }
     port_debug_printf("linha: fase x,y rumo EFD dDist>prox [mm bBordas+corr]\r\n");
 
     enter(ST_WAIT);
@@ -963,7 +1219,7 @@ void solver_update(void)
 
     case ST_SENSE:
         speed_ctl_stop();
-        if (st_ms >= SOLVER_SETTLE_MS)
+        if (st_ms >= settle_time())
         {
             /* MENOR dos dois frontais (a luz infla um deles). Alinha a partir
              * de SOLVER_ALIGN_TRIGGER: 16o teste, parado ~20-40 mm antes do
@@ -979,14 +1235,26 @@ void solver_update(void)
             else if (SOLVER_FRONT_ALIGN != 0)
             {
                 /* 22o teste: so' para frente, pelo FR-E (ver solver.h) */
+#if (SOLVER_FRONT_CENTRAL != 0)
+                /* MicroJM: parede na frente (central) mas ainda longe do
+                 * ponto de parada -> anda devagar ate' ele */
+                want_align = (f > SOLVER_FRONT_WALL_C) && (f < SOLVER_FALIGN_C_START);
+#else
                 want_align = (port_sensors_get_prox(SENSOR_FRONT_L) < SOLVER_FALIGN_START)
                           && (port_sensors_get_prox(SENSOR_FRONT_R) < SOLVER_FALIGN_FD_SAFE);
+#endif
+            }
+            if (front_peaked)
+            {
+                want_align = false;     /* ja' esta' perto demais: nunca avanca */
             }
             if (want_align && !aligned && start_checked && f > SOLVER_ALIGN_TRIGGER)
             {
                 aligned     = true;
                 align_start = speed_ctl_get_fwd_ticks();
                 align_count++;
+                speed_ctl_hold_mark();
+                front_peak_reset();
                 enter(ST_ALIGN);
                 break;
             }
@@ -1004,9 +1272,20 @@ void solver_update(void)
         if (SOLVER_FRONT_STOP_BY_SENSOR == 0)
         {
             /* so' para frente, ate' o FR-E chegar no centro */
+#if (SOLVER_FRONT_CENTRAL != 0)
+            if (front_peak_passed(f))
+            {
+                begin_deadback();
+                enter(ST_DEADBACK);     /* aligned = true: nao alinha de novo */
+                break;
+            }
+            if (f >= SOLVER_FRONT_STOP_C || f <= SOLVER_FRONT_WALL_C
+                || moved > SOLVER_FALIGN_MAX_MM || st_ms > SOLVER_FALIGN_TIMEOUT_MS)
+#else
             if (port_sensors_get_prox(SENSOR_FRONT_L) >= SOLVER_FALIGN_STOP
                 || port_sensors_get_prox(SENSOR_FRONT_R) >= SOLVER_FALIGN_FD_SAFE
                 || moved > SOLVER_FALIGN_MAX_MM || st_ms > SOLVER_FALIGN_TIMEOUT_MS)
+#endif
             {
                 speed_ctl_stop();
                 falign_mm = (int16_t)moved;
@@ -1029,7 +1308,7 @@ void solver_update(void)
 
     case ST_TURN:
     {
-        if (st_ms < SOLVER_TURN_PAUSE_MS)
+        if (st_ms < turn_pause_time())
         {
             speed_ctl_stop();
             break;
@@ -1075,7 +1354,7 @@ void solver_update(void)
         {
             speed_ctl_stop();
             settle_ms += NAV_PERIOD_MS;
-            if (settle_ms < SOLVER_TURN_SETTLE_MS)
+            if (settle_ms < turn_settle_time())
             {
                 break;
             }
@@ -1199,11 +1478,25 @@ void solver_update(void)
          * com o erro e perdia parede/batia em pino. Agora a parada pelo FR-E
          * so' vale perto do fim da distancia do encoder; fora dessa janela,
          * so' com a parede praticamente colada. */
+#if (SOLVER_FRONT_CENTRAL != 0)
+        /* MicroJM: central no ponto de parada perto do fim do encoder, ou
+         * parede praticamente colada a qualquer momento */
+        bool peak = front_peak_passed(front);   /* zona morta: para e recua */
+        if (peak)
+        {
+            begin_deadback();
+        }
+        /* 24/11: parede a ~2 cm em qualquer ponto do movimento -> para
+         * (APROXIMACAO, solver.h) */
+        if (SOLVER_FRONT_STOP_BY_SENSOR == 0
+            && (peak || front >= SOLVER_FRONT_GLUED_C || front >= SOLVER_FRONT_STOP_C))
+#else
         int16_t fe = port_sensors_get_prox(SENSOR_FRONT_L);
         if (SOLVER_FRONT_STOP_BY_SENSOR == 0
             && front >= SOLVER_FRONT_WALL_PROX
             && ((fe >= SOLVER_FRONT_SAFE_FE && remaining <= SOLVER_FRONT_SAFE_WINDOW_MM)
                 || fe >= SOLVER_FRONT_GLUED_FE))
+#endif
         {
             stop = true;                /* seguranca: parede colada na frente */
         }
@@ -1232,6 +1525,23 @@ void solver_update(void)
             /* min dos dois frontais: 11o teste, o FR-E sozinho lia 547 de luz
              * (FR-D 241), a media passava de 400 e o robo rastejava 45 mm a
              * mais (andou 225 mm na 1a celula) -> passou do ponto da curva */
+#if (SOLVER_FRONT_CENTRAL != 0)
+            /* 24/11: APROXIMACAO como no MAZE -- acabou o encoder mas a
+             * parede esta' na celula: continua devagar ate' ~2 cm */
+            if (front > SOLVER_APPROACH_DETECT_C && -remaining < SOLVER_APPROACH_MAX_MM)
+            {
+                creep_mm = -remaining;
+                float falta = (float)(SOLVER_FRONT_STOP_C - front);
+                float v = SPEED_APPROACH_MMS * (falta / 600.0f);
+                if (v > SPEED_APPROACH_MMS)      { v = SPEED_APPROACH_MMS; }
+                if (v < SOLVER_APPROACH_MIN_MMS) { v = SOLVER_APPROACH_MIN_MMS; }
+                drive_centered(v);
+            }
+            else
+            {
+                stop = true;
+            }
+#else
             if (SOLVER_FRONT_STOP_BY_SENSOR != 0
                 && front_min() > SOLVER_CREEP_DETECT_PROX && creep_mm < SOLVER_CREEP_MAX_MM)
             {
@@ -1242,16 +1552,29 @@ void solver_update(void)
             {
                 stop = true;
             }
+#endif
         }
         else
         {
-            float vmax = (phase == PH_RUN) ? SOLVER_RUN_MMS : SOLVER_EXPLORE_MMS;
-            float v    = SOLVER_MIN_MMS + SOLVER_BRAKE_GAIN * remaining;
+            float vmax = local_mode ? SOLVER_LOCAL_MMS
+                       : (phase == PH_RUN) ? SOLVER_RUN_MMS : SOLVER_EXPLORE_MMS;
+            float v    = SOLVER_MIN_MMS
+                       + (local_mode ? SOLVER_LOCAL_BRAKE_GAIN : SOLVER_BRAKE_GAIN) * remaining;
             if (v > vmax) { v = vmax; }
-            if (front_min() > SOLVER_NEAR_WALL_PROX && v > SPEED_APPROACH_MMS)
+            if (front_min() > FRONT_SLOW_PROX && v > SPEED_APPROACH_MMS)
             {
                 v = SPEED_APPROACH_MMS;     /* parede chegando: devagar */
             }
+#if (SOLVER_FRONT_CENTRAL != 0)
+            if (front > FRONT_SLOW_PROX)
+            {
+                /* 24/11: perto da parede freia proporcional ao que falta
+                 * (igual a' APROXIMA do MAZE) */
+                float fv = SPEED_APPROACH_MMS * ((float)(SOLVER_FRONT_STOP_C - front) / 600.0f);
+                if (fv < SOLVER_APPROACH_MIN_MMS) { fv = SOLVER_APPROACH_MIN_MMS; }
+                if (fv < v) { v = fv; }
+            }
+#endif
             drive_centered(move_boost(v));
         }
 
@@ -1281,11 +1604,13 @@ void solver_update(void)
             {
                 (void)maze_step(&cx, &cy, ch);
             }
-            enter(ST_SENSE);
+            /* parou por zona morta: recua antes de ler as paredes */
+            enter(peak ? ST_DEADBACK : ST_SENSE);
             break;
         }
 
-        uint32_t limit = 3000u + (uint32_t)move_cells * 4000u;
+        /* +5 s: a APROXIMACAO devagar (ate' 70 mm a 15 mm/s) cabe no limite */
+        uint32_t limit = 8000u + (uint32_t)move_cells * 4000u;
         if (st_ms > limit)
         {
             do_abort("andar demorou demais (preso?)");
@@ -1360,7 +1685,7 @@ void solver_update(void)
             enter(back);
             /* relogio do estado: o giro pula a pausa inicial; o movimento
              * recomeca a contagem do tempo limite (o tempo preso nao conta) */
-            st_ms = (back == ST_TURN) ? SOLVER_TURN_PAUSE_MS
+            st_ms = (back == ST_TURN) ? turn_pause_time()
                   : (back == ST_MOVE) ? (2u * NAV_PERIOD_MS)
                   : resume_ms;
             if (back == ST_MOVE)
@@ -1380,6 +1705,31 @@ void solver_update(void)
             else if (pr > pl + 200) { w =  SOLVER_UNSTICK_STEER_MMS; }
         }
         speed_ctl_set_vw(unstick_dir * SOLVER_UNSTICK_MMS, w);
+        break;
+    }
+
+    case ST_DEADBACK:
+    {
+        /* Recua devagar segurando o rumo. A leitura primeiro SOBE (volta ao
+         * pico) e depois CAI: chegando a SOLVER_FRONT_STOP_C o robo esta' de
+         * novo no lado bom da curva (~2 cm). Limites de distancia e tempo. */
+        int16_t f = front_min();
+        if (f > db_max) { db_max = f; }
+        bool  rose = (db_max >= db_start + SENSOR_BACKOFF_RISE);
+        bool  fell = rose && (f <= db_max - 20)
+                  && (f <= SOLVER_FRONT_STOP_C || f <= db_max - SENSOR_DEAD_DROP);
+        float back = (float)(db_fwd0 - speed_ctl_get_fwd_ticks()) * mm_per_tick();
+
+        if (fell || back >= SENSOR_BACKOFF_MAX_MM || st_ms >= SENSOR_BACKOFF_TIMEOUT_MS)
+        {
+            speed_ctl_stop();
+            port_debug_printf("recuou %d mm, frente %d (max %d)%s\r\n",
+                              (int)back, (int)f, (int)db_max,
+                              fell ? "" : " -- NAO achou o pico, segue assim");
+            enter(ST_SENSE);
+            break;
+        }
+        speed_ctl_set_vw(-SENSOR_BACKOFF_MMS, speed_ctl_hold_turn());
         break;
     }
 
@@ -1439,4 +1789,29 @@ void solver_dump(void)
 
     maze_flood(false);
     maze_print(out, cx, cy, ch);
+}
+
+bool solver_front_wall_seen(void)
+{
+    return front_wall_seen();
+}
+
+int8_t solver_side_wall(sensor_id_t s)
+{
+    return side_tri(s);
+}
+
+void solver_set_decision_log(bool on)
+{
+    dec_log = on;
+}
+
+void solver_set_explore_only(bool on)
+{
+    explore_only = on;
+}
+
+void solver_set_local_mode(bool on)
+{
+    local_mode = on;
 }

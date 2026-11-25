@@ -51,6 +51,23 @@ int32_t  sensors_get_cal_far(sensor_id_t s);
 int32_t  sensors_get_cal_near(sensor_id_t s);
 const char *sensors_name(sensor_id_t s);
 
+/* --- Zona morta do Sharp (24/11, SENSOR_DEAD_* no board.h) ------------- */
+typedef enum
+{
+    SENSOR_ZONE_OK = 0,     /* leitura normal                              */
+    SENSOR_ZONE_PEAK,       /* perto do topo da curva (parede bem perto)   */
+    SENSOR_ZONE_DEAD        /* passou do pico: mais perto que ~1,3 cm      */
+} sensor_zone_t;
+
+/** @brief Zera o maximo guardado (chamar no inicio de cada aproximacao). */
+void          sensors_dead_reset(sensor_id_t s);
+/** @brief Atualiza e classifica. Chamar a cada dt_ms SO' com o robo indo em
+ *         direcao a' parede (a queda tambem acontece ao passar uma abertura). */
+sensor_zone_t sensors_dead_update(sensor_id_t s, uint32_t dt_ms);
+/** @brief Maior leitura desde o ultimo reset (para o log). */
+int16_t       sensors_dead_max(sensor_id_t s);
+const char   *sensors_zone_name(sensor_zone_t z);
+
 /* Funcoes legadas para testes */
 uint16_t sensors_read_raw(uint32_t channel);
 void     sensors_read_all(uint16_t raw[5]);

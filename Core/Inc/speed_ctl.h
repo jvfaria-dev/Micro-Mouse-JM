@@ -76,6 +76,13 @@ int32_t speed_ctl_get_fwd_ticks(void);
 /** @brief Zera odometria (distancia, angulo e contagem crua). */
 void speed_ctl_reset_odometry(void);
 
+/** @brief Marca o rumo ATUAL (diferenca de ticks) como referencia. */
+void speed_ctl_hold_mark(void);
+
+/** @brief Termo de giro (mm/s, para speed_ctl_set_vw) que devolve o robo ao
+ *         rumo marcado: a roda que ficou para tras alcanca a outra. */
+float speed_ctl_hold_turn(void);
+
 /* ---------------------------------------------------------------------------
  * DETECCAO DE RODA MUDA
  * ---------------------------------------------------------------------------
